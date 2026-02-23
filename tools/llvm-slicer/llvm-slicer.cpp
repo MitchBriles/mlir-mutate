@@ -17,6 +17,11 @@
 
 #include <fstream>
 #include <iostream>
+#include <llvm/IR/InstrTypes.h>
+#include <llvm/IR/Instruction.h>
+#include <llvm/IR/Instructions.h>
+#include <llvm/IR/Intrinsics.h>
+#include <llvm/Support/Casting.h>
 #include <sstream>
 #include <utility>
 #include <filesystem>
@@ -95,9 +100,38 @@ std::string getOutputPath(std::string&& fileName){
     return outputFolder+'/'+fileName;
 }
 
+llvm::Function* getDetachedCallee(
+        const llvm::Function *Callee,
+        std::unordered_map<const llvm::Function*, llvm::Function*> &detachedCallees) {
+    if (auto it = detachedCallees.find(Callee); it != detachedCallees.end()) {
+        return it->second;
+    }
+
+    auto *detached = llvm::Function::Create(
+            Callee->getFunctionType(),
+            Callee->getLinkage(),
+            Callee->getAddressSpace(),
+            Callee->getName());
+    detached->copyAttributesFrom(Callee);
+    detachedCallees.emplace(Callee, detached);
+    return detached;
+}
+
+bool shouldAbstractOperand(const llvm::Instruction *I, const llvm::Value *Op) {
+    if (const auto *Call = llvm::dyn_cast<llvm::CallBase>(I)) {
+        if (Op == Call->getCalledOperand()) {
+            if (llvm::isa<llvm::Function>(Op)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 llvm::Function* moveToFunction(llvm::LLVMContext& ctx, llvm::SmallVector<llvm::Instruction*> insts){
     std::unordered_map<llvm::Value*,size_t> valSet;
     std::unordered_map<llvm::Value*, llvm::Value*> valMapping;
+    std::unordered_map<const llvm::Function*, llvm::Function*> detachedCallees;
     //cloning all operations into a basic block
     //and collecting function arguments
     auto bb=llvm::BasicBlock::Create(ctx);
@@ -109,7 +143,17 @@ llvm::Function* moveToFunction(llvm::LLVMContext& ctx, llvm::SmallVector<llvm::I
             if(valMapping.find(ithOperand)!=valMapping.end()){
                 newInst->setOperand(i, valMapping[ithOperand]);
             }else{
-                valSet.emplace(ithOperand, 0);
+                if (auto *call = llvm::dyn_cast<llvm::CallBase>(newInst);
+                    call && ithOperand == call->getCalledOperand()) {
+                    if (auto *callee = llvm::dyn_cast<llvm::Function>(ithOperand)) {
+                        newInst->setOperand(i, getDetachedCallee(callee, detachedCallees));
+                        continue;
+                    }
+                }
+
+                if (shouldAbstractOperand(newInst, ithOperand)) {
+                    valSet.emplace(ithOperand, 0);
+                }
             }
         }
         newInst->insertInto(bb,bb->end());
@@ -136,44 +180,25 @@ llvm::Function* moveToFunction(llvm::LLVMContext& ctx, llvm::SmallVector<llvm::I
     return function;
 }
 
-void saveFunctionToFile(llvm::Function* func, const std::string &Path) {
-    /*std::error_code EC;
-    llvm::raw_fd_ostream OS(Path, EC, llvm::sys::fs::OF_Text);
-
-    if (EC) {
-        llvm::errs() << "Error opening file " << Path << ": " << EC.message() << "\n";
-        return;
-    }
-
-    // Print only the function body (with definition).
-    func->print(OS, nullptr);*/
-    using namespace llvm;
-    if (!func) {
-        errs() << "Error: null Function pointer.\n";
-        return;
-    }
-
-    // 1. Dump the function IR to a string
+std::string getCanonicalPatternText(llvm::Function* func) {
+    if (!func) return "";
     std::string funcStr;
     {
-        raw_string_ostream rso(funcStr);
+        llvm::raw_string_ostream rso(funcStr);
         func->print(rso);
     }
-
-    // 2. Remove all integer type patterns (i1, i8, i16, i32, i64, etc.)
     std::regex intTypeRegex(R"(i[0-9]+)");
-    std::string cleaned = std::regex_replace(funcStr, intTypeRegex, "%int");
+    return std::regex_replace(funcStr, intTypeRegex, "%int");
+}
 
-    // 3. Save to file
+void savePatternToFile(const std::string& patternText, unsigned count, const std::string &Path) {
     std::ofstream outFile(Path);
     if (!outFile) {
         llvm::errs() << "Error: cannot open file for writing: " << Path << "\n";
         return;
     }
-
-    outFile << cleaned;
+    outFile << count << "\n" << patternText;
     outFile.close();
-
 }
 
 void updateCntMap(std::unordered_map<unsigned, unsigned>& umap, unsigned opCode){
@@ -193,20 +218,49 @@ bool isCallToNonIntrinsic(const llvm::Instruction *I) {
     return false;
 }
 
+bool isCallInteresting(const llvm::CallBase *Call) {
+    llvm::Function *Callee = Call->getCalledFunction();
+    if (!Callee) return false;
+    
+    if (Callee->isIntrinsic()) {
+        switch (Callee->getIntrinsicID()) {
+        // FPCore ops
+#define IS(x) case llvm::Intrinsic::x
+        IS(fabs):
+        IS(fma): IS(fmuladd):
+        IS(exp): IS(exp2):
+        IS(log): IS(log10): IS(log2):
+        IS(pow): IS(sqrt):
+        IS(sin): IS(cos): IS(tan):
+        IS(asin): IS(acos): IS(atan): IS(atan2):
+        IS(sinh): IS(cosh): IS(tanh):
+        IS(ceil): IS(floor): IS(modf):
+        IS(maxnum): IS(maximum): IS(maximumnum):
+        IS(minnum): IS(minimum): IS(minimumnum):
+        IS(fptrunc_round): IS(round): IS(nearbyint):
+        IS(is_fpclass):
+            return true;
+        default:
+            return false;
+#undef IS
+        }
+    }
+
+    return llvm::StringSwitch<bool>(Callee->getName())
+      .Case("log", true).Case("sin", true).Case("cos", true)
+      .Case("tan", true).Case("sqrt", true).Case("hypot", true)
+      .Default(false);
+}
+
 bool specialCheck(const llvm::Instruction *I) {
-    return llvm::isa<llvm::PHINode>(I) || llvm::isa<llvm::LandingPadInst>(I)
-           //|| isCallToNonIntrinsic(I)
-           || llvm::isa<llvm::AtomicRMWInst>(I)
-           ||llvm::isa<llvm::CallBase>(I)
-           || llvm::isa<llvm::LoadInst>(I)
-           || llvm::isa<llvm::AllocaInst>(I) || llvm::isa<llvm::StoreInst>(I)
-           || !llvm::isa<llvm::Operator>(I)
-           || llvm::isa<llvm::UnaryInstruction>(I)
-           //|| llvm::isa<llvm::ICmpInst>(I)
-           || llvm::isa<llvm::ZExtInst>(I)
-           || llvm::isa<llvm::SExtInst>(I) || llvm::isa<llvm::TruncInst>(I)
-           || llvm::isa<llvm::GetElementPtrInst>(I) || llvm::isa<llvm::SelectInst>(I)
-           || llvm::isa<llvm::PtrToIntInst>(I);
+    if (const llvm::CallBase *Call = llvm::dyn_cast<llvm::CallBase>(I))
+        return !isCallInteresting(Call);
+    unsigned Op = I->getOpcode();
+#define IS(x) Op == llvm::Instruction::x
+    return !(llvm::isa<llvm::FCmpInst>(I) || llvm::isa<llvm::SelectInst>(I) ||
+           IS(FAdd) || IS(FSub) || IS(FMul) || IS(FDiv) || IS(FPTrunc) || 
+           IS(FNeg) || IS(FCmp)) || IS(FRem);
+#undef IS
 }
 
 void canonicalizeFunction(llvm::Function* func){
@@ -320,7 +374,7 @@ std::vector<llvm::Function*> enumeratePatternWithSize(llvm::Function* func, int 
 }
 
 void sliceInstruction(llvm::Instruction* inst, llvm::SmallVector<llvm::Instruction*>& insts, int depth){
-    if(depth!=0&&inst->getType()->isIntegerTy()&&!specialCheck(inst)){
+    if(depth != 0 && inst->getType()->isFloatingPointTy() && !specialCheck(inst)){
         insts.push_back(inst);
         for(size_t i=0;i<inst->getNumOperands();++i){
             auto operand_inst = llvm::dyn_cast<llvm::Instruction>(inst->getOperand(i));
@@ -332,9 +386,20 @@ void sliceInstruction(llvm::Instruction* inst, llvm::SmallVector<llvm::Instructi
 }
 
 void walkModule(std::shared_ptr<llvm::Module> module, int depth, const std::vector<int>& patternSizeVec){
+    std::unordered_map<std::string, std::pair<unsigned, std::string>> patternCounts;
+    auto recordPattern = [&](llvm::Function *pattern) {
+        std::string patternText = getCanonicalPatternText(pattern);
+        auto [it, inserted] = patternCounts.emplace(patternText, std::make_pair(0U, std::string()));
+        if (inserted) {
+            it->second.second = getOutputPath("pattern_" + std::to_string(patternCounts.size() - 1) + ".ll");
+        }
+        it->second.first += 1;
+    };
+
     bool shouldSlice = depth >1;
     llvm::SmallVector<llvm::Instruction*> insts;
     for(llvm::Function& func:*module){
+        if (func.isDeclaration()) continue;
         for(auto it=llvm::inst_begin(func), end_it = llvm::inst_end(func);it!=end_it;++it){
             //Slice on the current instruction
             if(shouldSlice && !it->isTerminator()&& !specialCheck(&*it)){
@@ -343,7 +408,6 @@ void walkModule(std::shared_ptr<llvm::Module> module, int depth, const std::vect
                     std::reverse(insts.begin(), insts.end());
                     auto func = moveToFunction(module->getContext(), insts);
                     canonicalizeFunction(func);
-                    auto outputPath = getOutputPath(func->getName().str());
                     func->setName("tmp");
                     //exclude the last return instruction
                     auto funcSize = func->getInstructionCount()-1;
@@ -357,15 +421,12 @@ void walkModule(std::shared_ptr<llvm::Module> module, int depth, const std::vect
                             for(auto pattern:patterns){
 
                                 canonicalizeFunction(pattern);
-                                outputPath = getOutputPath(pattern->getName().str());
                                 pattern->setName("tmp");
-                                saveFunctionToFile(pattern, outputPath);
-                                ++saveFuncs;
+                                recordPattern(pattern);
                             }
                         }
                     }else{
-                        saveFunctionToFile(func,outputPath);
-                        ++saveFuncs;
+                        recordPattern(func);
                     }
                 }
                 insts.clear();
@@ -384,6 +445,11 @@ void walkModule(std::shared_ptr<llvm::Module> module, int depth, const std::vect
                 updateCntMap(binaryOpsCnt, opCode);
             }
         }
+    }
+
+    for (const auto& [patternText, countAndPath] : patternCounts) {
+        savePatternToFile(patternText, countAndPath.first, countAndPath.second);
+        ++saveFuncs;
     }
 }
 
