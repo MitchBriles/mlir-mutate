@@ -17,6 +17,8 @@
 
 #include <fstream>
 #include <iostream>
+#include <llvm/ADT/APFloat.h>
+#include <llvm/IR/Constant.h>
 #include <llvm/IR/InstrTypes.h>
 #include <llvm/IR/Instruction.h>
 #include <llvm/IR/Instructions.h>
@@ -60,6 +62,20 @@ namespace {
             llvm::cl::cat(mutatorArgs),
             llvm::cl::ZeroOrMore
     );
+
+    llvm::cl::opt<int> minPatternDepth(
+            "min-pattern-depth",
+            llvm::cl::desc("Minimum pattern DAG depth to keep"),
+            llvm::cl::value_desc("N"),
+            llvm::cl::cat(mutatorArgs),
+            llvm::cl::init(1));
+
+    llvm::cl::opt<int> maxFreeVars(
+            "max-free-vars",
+            llvm::cl::desc("Maximum number of args for sliced pattern"),
+            llvm::cl::value_desc("N"),
+            llvm::cl::cat(mutatorArgs),
+            llvm::cl::init(100));
 
 
 }
@@ -128,6 +144,13 @@ bool shouldAbstractOperand(const llvm::Instruction *I, const llvm::Value *Op) {
     return true;
 }
 
+llvm::Instruction* cloneWithoutMetadata(const llvm::Instruction *Inst) {
+    auto *Clone = Inst->clone();
+    Clone->eraseMetadataIf([](unsigned, llvm::MDNode *) { return true; });
+    Clone->setDebugLoc(llvm::DebugLoc());
+    return Clone;
+}
+
 llvm::Function* moveToFunction(llvm::LLVMContext& ctx, llvm::SmallVector<llvm::Instruction*> insts){
     std::unordered_map<llvm::Value*,size_t> valSet;
     std::unordered_map<llvm::Value*, llvm::Value*> valMapping;
@@ -136,13 +159,14 @@ llvm::Function* moveToFunction(llvm::LLVMContext& ctx, llvm::SmallVector<llvm::I
     //and collecting function arguments
     auto bb=llvm::BasicBlock::Create(ctx);
     for(auto& inst:insts){
-        auto newInst = inst->clone();
-        newInst->setMetadata(llvm::LLVMContext::MD_tbaa, nullptr);
+        auto newInst = cloneWithoutMetadata(inst);
         for(size_t i=0;i<newInst->getNumOperands();++i){
             auto ithOperand = newInst->getOperand(i);
-            if(valMapping.find(ithOperand)!=valMapping.end()){
+            if (valMapping.find(ithOperand)!=valMapping.end()){
                 newInst->setOperand(i, valMapping[ithOperand]);
-            }else{
+            } else if (auto *C = llvm::dyn_cast<llvm::ConstantFP>(ithOperand)) {
+                newInst->setOperand(i, C);
+            } else {
                 if (auto *call = llvm::dyn_cast<llvm::CallBase>(newInst);
                     call && ithOperand == call->getCalledOperand()) {
                     if (auto *callee = llvm::dyn_cast<llvm::Function>(ithOperand)) {
@@ -176,7 +200,7 @@ llvm::Function* moveToFunction(llvm::LLVMContext& ctx, llvm::SmallVector<llvm::I
             }
         }
     }
-    auto returnInst = llvm::ReturnInst::Create(ctx, &bb->back(), bb);
+    /*  auto returnInst = */ llvm::ReturnInst::Create(ctx, &bb->back(), bb);
     return function;
 }
 
@@ -263,6 +287,10 @@ bool specialCheck(const llvm::Instruction *I) {
 #undef IS
 }
 
+bool isKindaCommutative(llvm::Instruction &I) {
+    return I.isCommutative();
+}
+
 void canonicalizeFunction(llvm::Function* func){
     size_t idx =0;
     for(auto arg_it = func->arg_begin();arg_it!=func->arg_end();++arg_it){
@@ -270,7 +298,7 @@ void canonicalizeFunction(llvm::Function* func){
         ++idx;
     }
     for(auto it=llvm::inst_begin(func);it!=llvm::inst_end(func);++it){
-        if(it->isCommutative()){
+        if(isKindaCommutative(*it)){
             if(it->getOperand(0)->getName()>it->getOperand(1)->getName()){
                 auto val=it->getOperand(1);
                 it->setOperand(1, it->getOperand(0));
@@ -289,7 +317,7 @@ int getDAGSize(llvm::Value* val, std::unordered_map<llvm::Value*, int>& sizeMap)
     auto it=sizeMap.find(val);
     if(it==sizeMap.end()){
         auto inst = llvm::dyn_cast_or_null<llvm::Instruction>(val);
-        if(!inst){
+        if(!inst || inst->getNumOperands() != 2){
             sizeMap.emplace(val, 0);
         }else{
             sizeMap.emplace(val, getDAGSize(inst->getOperand(0), sizeMap)+
@@ -308,6 +336,9 @@ std::vector<llvm::Value*> enumeratePatternHelper(llvm::Value* v, int size, std::
         return {v};
     }
     llvm::Instruction* inst = llvm::dyn_cast<llvm::Instruction>(v);
+    if (inst->getNumOperands() != 2) {
+        return {v};
+    }
     std::vector<llvm::Value*> result;
     int lhsSize= getDAGSize(inst->getOperand(0), sizeMap), rhsSize= getDAGSize(inst->getOperand(1), sizeMap);
     int  lhsUpperBound = min(lhsSize, size-1), lhsLowerBound=max(0, size-1-rhsSize);
@@ -317,7 +348,7 @@ std::vector<llvm::Value*> enumeratePatternHelper(llvm::Value* v, int size, std::
         auto rhsValues = enumeratePatternHelper(inst->getOperand(1), rhs, sizeMap);
         for(const auto& lhsVal :lhsValues){
             for(const auto& rhsVal :rhsValues){
-                auto cloneInst = inst->clone();
+                auto cloneInst = cloneWithoutMetadata(inst);
                 cloneInst->setOperand(0, lhsVal);
                 cloneInst->setOperand(1, rhsVal);
                 result.push_back(cloneInst);
@@ -334,7 +365,7 @@ llvm::Function* copyToFunction(llvm::Instruction* source){
         auto inst = stack.back();
         stack.pop_back();
         insts.push_back(inst);
-        for(int i=0;i<2;++i){
+        for(unsigned i = 0; i < inst->getNumOperands(); ++i){
 
             if(auto operand = llvm::dyn_cast_or_null<llvm::Instruction>(inst->getOperand(i));operand&&operand->getParent()==nullptr){
                 stack.push_back(llvm::dyn_cast<llvm::Instruction>(operand));
@@ -357,6 +388,31 @@ llvm::Value* getUniqueReturn(llvm::Function* func){
     }
     if (!uniqueResult) assert(false && "Return void type");
     return uniqueResult;
+}
+
+unsigned getValueDepth(llvm::Value *V, std::unordered_map<llvm::Value*, unsigned> &depthMap) {
+    if (auto it = depthMap.find(V); it != depthMap.end()) {
+        return it->second;
+    }
+    auto *I = llvm::dyn_cast<llvm::Instruction>(V);
+    if (!I) {
+        depthMap.emplace(V, 0);
+        return 0;
+    }
+
+    unsigned maxOperandDepth = 0;
+    for (unsigned i = 0; i < I->getNumOperands(); ++i) {
+        maxOperandDepth = std::max(maxOperandDepth, getValueDepth(I->getOperand(i), depthMap));
+    }
+    unsigned depth = 1 + maxOperandDepth;
+    depthMap.emplace(V, depth);
+    return depth;
+}
+
+unsigned getPatternDepth(llvm::Function *func) {
+    llvm::Value *uniqueResult = getUniqueReturn(func);
+    std::unordered_map<llvm::Value*, unsigned> depthMap;
+    return getValueDepth(uniqueResult, depthMap);
 }
 
 
@@ -388,6 +444,10 @@ void sliceInstruction(llvm::Instruction* inst, llvm::SmallVector<llvm::Instructi
 void walkModule(std::shared_ptr<llvm::Module> module, int depth, const std::vector<int>& patternSizeVec){
     std::unordered_map<std::string, std::pair<unsigned, std::string>> patternCounts;
     auto recordPattern = [&](llvm::Function *pattern) {
+        if (getPatternDepth(pattern) < static_cast<unsigned>(minPatternDepth) ||
+            pattern->arg_size() > static_cast<unsigned>(maxFreeVars)) {
+            return;
+        }
         std::string patternText = getCanonicalPatternText(pattern);
         auto [it, inserted] = patternCounts.emplace(patternText, std::make_pair(0U, std::string()));
         if (inserted) {
@@ -517,6 +577,11 @@ see alive-mutate --help for more options,
 
     llvm::cl::HideUnrelatedOptions(mutatorArgs);
     llvm::cl::ParseCommandLineOptions(argc, argv, Usage);
+
+    if (!filesystem::exists(string(inputFile))) {
+        llvm::errs() << "Skipping missing input file: " << inputFile << "\n";
+        return 0;
+    }
 
     auto uni_M1 = openInputFile(Context, inputFile);
     std::shared_ptr M1 = std::move(uni_M1);
