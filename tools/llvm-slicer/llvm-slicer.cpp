@@ -19,12 +19,14 @@
 #include <iostream>
 #include <llvm/ADT/APFloat.h>
 #include <llvm/IR/Constant.h>
+#include <llvm/IR/GlobalValue.h>
 #include <llvm/IR/InstrTypes.h>
 #include <llvm/IR/Instruction.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/Intrinsics.h>
 #include <llvm/Support/Casting.h>
 #include <sstream>
+#include <string>
 #include <utility>
 #include <filesystem>
 #include <unordered_set>
@@ -125,10 +127,10 @@ llvm::Function* getDetachedCallee(
 
     auto *detached = llvm::Function::Create(
             Callee->getFunctionType(),
-            Callee->getLinkage(),
-            Callee->getAddressSpace(),
+            llvm::GlobalValue::ExternalLinkage,
             Callee->getName());
-    detached->copyAttributesFrom(Callee);
+    // detached->copyAttributesFrom(Callee);
+    detached->setAttributes({});
     detachedCallees.emplace(Callee, detached);
     return detached;
 }
@@ -171,6 +173,7 @@ llvm::Function* moveToFunction(llvm::LLVMContext& ctx, llvm::SmallVector<llvm::I
                     call && ithOperand == call->getCalledOperand()) {
                     if (auto *callee = llvm::dyn_cast<llvm::Function>(ithOperand)) {
                         newInst->setOperand(i, getDetachedCallee(callee, detachedCallees));
+                        call->setAttributes(llvm::AttributeList());
                         continue;
                     }
                 }
@@ -212,7 +215,11 @@ std::string getCanonicalPatternText(llvm::Function* func) {
         func->print(rso);
     }
     std::regex intTypeRegex(R"(i[0-9]+)");
-    return std::regex_replace(funcStr, intTypeRegex, "%int");
+    funcStr = std::regex_replace(funcStr, intTypeRegex, "%int");
+    std::regex tailCallRegex(R"(tail call)");
+    funcStr = std::regex_replace(funcStr, tailCallRegex, "call");
+    std::regex addrspaceRegex(R"( addrspace\([0-9]+\))");
+    return std::regex_replace(funcStr, addrspaceRegex, "");
 }
 
 void savePatternToFile(const std::string& patternText, unsigned count, const std::string &Path) {
@@ -273,6 +280,10 @@ bool isCallInteresting(const llvm::CallBase *Call) {
     return llvm::StringSwitch<bool>(Callee->getName())
       .Case("log", true).Case("sin", true).Case("cos", true)
       .Case("tan", true).Case("sqrt", true).Case("hypot", true)
+      .Case("asin", true).Case("sinh", true)
+      .Case("acos", true).Case("cosh", true)
+      .Case("atan", true).Case("tanh", true).Case("atan2", true)
+      .Case("tan", true).Case("sqrt", true).Case("hypot", true)
       .Default(false);
 }
 
@@ -294,7 +305,7 @@ bool isKindaCommutative(llvm::Instruction &I) {
 void canonicalizeFunction(llvm::Function* func){
     size_t idx =0;
     for(auto arg_it = func->arg_begin();arg_it!=func->arg_end();++arg_it){
-        arg_it->setName(to_string(idx));
+        arg_it->setName("_" + to_string(idx));
         ++idx;
     }
     for(auto it=llvm::inst_begin(func);it!=llvm::inst_end(func);++it){
@@ -306,7 +317,7 @@ void canonicalizeFunction(llvm::Function* func){
             }
         }
         if(it->getType()!=llvm::Type::getVoidTy(func->getContext())){
-            it->setName(to_string(idx));
+            it->setName("_" + to_string(idx));
             idx+=1;
         }
     }
