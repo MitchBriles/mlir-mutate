@@ -154,7 +154,8 @@ llvm::Instruction* cloneWithoutMetadata(const llvm::Instruction *Inst) {
 }
 
 llvm::Function* moveToFunction(llvm::LLVMContext& ctx, llvm::SmallVector<llvm::Instruction*> insts){
-    std::unordered_map<llvm::Value*,size_t> valSet;
+    std::unordered_map<llvm::Value*, size_t> valSet;
+    llvm::SmallVector<llvm::Value*> argOrder;
     std::unordered_map<llvm::Value*, llvm::Value*> valMapping;
     std::unordered_map<const llvm::Function*, llvm::Function*> detachedCallees;
     //cloning all operations into a basic block
@@ -179,7 +180,10 @@ llvm::Function* moveToFunction(llvm::LLVMContext& ctx, llvm::SmallVector<llvm::I
                 }
 
                 if (shouldAbstractOperand(newInst, ithOperand)) {
-                    valSet.emplace(ithOperand, 0);
+                    if (valSet.find(ithOperand) == valSet.end()) {
+                        valSet.emplace(ithOperand, argOrder.size());
+                        argOrder.push_back(ithOperand);
+                    }
                 }
             }
         }
@@ -188,9 +192,9 @@ llvm::Function* moveToFunction(llvm::LLVMContext& ctx, llvm::SmallVector<llvm::I
     }
 
     llvm::SmallVector<llvm::Type*> args;
-    for(auto& arg: valSet){
-        arg.second = args.size();
-        args.push_back(arg.first->getType());
+    args.reserve(argOrder.size());
+    for (auto *arg : argOrder) {
+        args.push_back(arg->getType());
     }
     auto functionType = llvm::FunctionType::get(insts.back()->getType(), args, false);
     auto function = llvm::Function::Create(functionType, llvm::Function::ExternalLinkage, generateFunctionName());
